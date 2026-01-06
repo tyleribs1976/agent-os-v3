@@ -1,0 +1,12 @@
+--- src/constants.py
++++ src/constants.py
+@@ -25,6 +25,9 @@
+ DRAFT_TIMEOUT = 600
+ DEFAULT_TIMEOUT = 300
+ VERIFY_TIMEOUT = 300
+ EXECUTE_TIMEOUT = 300
+ 
++# Logging configuration
++LOG_LEVEL = "INFO"
++
+ # Error codes

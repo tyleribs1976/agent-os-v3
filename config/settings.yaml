@@ -1,0 +1,49 @@
+# Agent-OS v3 Configuration
+# This file contains database, logging, and timeout settings
+
+database:
+  host: localhost
+  port: 5432
+  name: agent_os_v3
+  user: maestro
+  password: maestro_secret_2024
+  pool:
+    min_connections: 2
+    max_connections: 10
+
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  file: logs/orchestrator.log
+  max_bytes: 10485760
+  backup_count: 5
+
+timeouts:
+  task_execution: 3600
+  llm_call: 300
+  git_operation: 180
+  checkpoint_retention_days: 90
+
+notifications:
+  telegram:
+    enabled: true
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
+  pushover:
+    enabled: false
+    user_key: ${PUSHOVER_USER_KEY}
+    api_token: ${PUSHOVER_API_TOKEN}
+
+models:
+  drafter: claude-sonnet-4-20250514
+  verifier: claude-sonnet-4-20250514
+  compliance: claude-sonnet-4-20250514
+
+confidence:
+  drafter_threshold: 0.70
+  verifier_threshold: 0.90
+
+feature_flags:
+  use_groq_validation: false
+  skip_git_push: true
+  skip_pr_creation: true

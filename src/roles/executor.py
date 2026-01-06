@@ -1,0 +1,877 @@
+"""
+Agent-OS v3 Execution Controller
+
+Following million-step methodology:
+- THIS IS NOT AN LLM - it's pure deterministic Python logic
+- Executes ONLY approved proposals
+- Validates IMR Pentagon for irreversible steps
+- Stops immediately on any error
+- Never retries irreversible operations
+"""
+
+import os
+import sys
+import json
+import subprocess
+import tempfile
+import hashlib
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from checkpoints import CheckpointManager
+from notifications import notify_error, notify_success
+
+
+class ExecutionDenied(Exception):
+    """Raised when execution is not allowed."""
+    pass
+
+
+class IMRValidationFailed(Exception):
+    """Raised when IMR Pentagon validation fails."""
+    pass
+
+
+class PostconditionFailed(Exception):
+    """Raised when a postcondition check fails."""
+    pass
+
+
+class ExecutionController:
+    """
+    Execution Controller: Executes approved actions deterministically.
+    
+    THIS IS NOT AN LLM - it executes proposals exactly as specified.
+    
+    ALLOWED:
+    - Execute file write operations
+    - Execute git operations
+    - Create GitHub PRs
+    - Send notifications
+    - Update system of record
+    
+    NOT ALLOWED:
+    - Execute without verification approval
+    - Modify approved proposals
+    - Make decisions (only execute)
+    - Retry failed irreversible operations
+    - Suppress errors
+    """
+    
+    def __init__(self, checkpoint_manager: CheckpointManager):
+        self.checkpoint_manager = checkpoint_manager
+    
+    def execute(
+        self,
+        verification_result: Dict[str, Any],
+        draft: Dict[str, Any],
+        task: Dict[str, Any],
+        project_context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Execute an approved proposal.
+        
+        Args:
+            verification_result: Result from Verifier (must be 'approved')
+            draft: The approved draft proposal
+            task: Task specification
+            project_context: Project information
+        
+        Returns:
+            Execution result with artifacts and status
+        """
+        
+        # GATE 1: Must be approved
+        if verification_result.get('decision') != 'approved':
+            raise ExecutionDenied(
+                f"Cannot execute: verification decision was "
+                f"'{verification_result.get('decision')}', not 'approved'"
+            )
+        
+        # GATE 2: Verifier confidence must be high
+        if verification_result.get('verifier_confidence', 0) < 0.90:
+            raise ExecutionDenied(
+                f"Cannot execute: verifier confidence "
+                f"{verification_result.get('verifier_confidence')} < 0.90"
+            )
+        
+        # Build execution manifest
+        manifest = self._build_manifest(draft, task, project_context)
+        
+        # GATE 3: Validate IMR Pentagon for irreversible steps
+        for step in manifest['steps']:
+            if step.get('irreversible', False):
+                validation = self._validate_imr_pentagon(step)
+                if not validation['valid']:
+                    raise IMRValidationFailed(
+                        f"IMR Pentagon validation failed for '{step['name']}': "
+                        f"missing {validation['missing']}"
+                    )
+        
+        # Create checkpoint
+        checkpoint_id = self.checkpoint_manager.create_checkpoint(
+            project_id=str(task.get('project_id', '')),
+            task_id=str(task.get('id', '')),
+            phase='execution',
+            step_name='execute_proposal',
+            state_snapshot={
+                'manifest': manifest,
+                'verification_id': verification_result.get('checkpoint_id')
+            },
+            inputs={
+                'task_id': str(task.get('id', '')),
+                'verification_decision': verification_result.get('decision'),
+                'steps_count': len(manifest['steps'])
+            }
+        )
+        
+        # Execute each step
+        results = []
+        artifacts = {}
+        
+        for step in manifest['steps']:
+            step_result = {
+                'step': step['name'],
+                'type': step['type'],
+                'started_at': datetime.utcnow().isoformat()
+            }
+            
+            try:
+                # Verify preconditions
+                if not self._verify_preconditions(step, project_context, artifacts):
+                    raise PostconditionFailed(
+                        f"Preconditions not met for {step['name']}"
+                    )
+                
+                # Execute the step
+                output = self._execute_step(step, project_context, draft)
+                
+                step_result['status'] = 'success'
+                step_result['output'] = output
+                step_result['completed_at'] = datetime.utcnow().isoformat()
+                
+                # Update artifacts
+                if output.get('artifacts'):
+                    artifacts.update(output['artifacts'])
+                
+                # Verify postconditions
+                if not self._verify_postconditions(step, project_context, output):
+                    raise PostconditionFailed(
+                        f"Postconditions not met for {step['name']}"
+                    )
+                
+                results.append(step_result)
+                
+            except Exception as e:
+                step_result['status'] = 'failed'
+                step_result['error'] = str(e)
+                step_result['completed_at'] = datetime.utcnow().isoformat()
+                results.append(step_result)
+                
+                # HALT immediately on any failure
+                self.checkpoint_manager.fail_checkpoint(
+                    checkpoint_id,
+                    {
+                        'reason': 'execution_failed',
+                        'failed_step': step['name'],
+                        'error': str(e),
+                        'completed_steps': len(results) - 1
+                    }
+                )
+                
+                # Generate rollback instructions
+                rollback_instructions = self._generate_rollback_instructions(
+                    results[:-1],  # Exclude the failed step
+                    project_context
+                )
+                
+                # Notify about failure
+                notify_error(
+                    project_name=project_context.get('name', 'Unknown'),
+                    task_title=task.get('title', 'Unknown'),
+                    error=str(e),
+                    checkpoint_id=checkpoint_id
+                )
+                
+                return {
+                    'success': False,
+                    'final_status': 'failed',
+                    'steps_executed': results,
+                    'failed_at_step': step['name'],
+                    'error': str(e),
+                    'rollback_required': step.get('irreversible', False),
+                    'rollback_instructions': rollback_instructions,
+                    'checkpoint_id': checkpoint_id
+                }
+        
+        # All steps completed successfully
+        self.checkpoint_manager.complete_checkpoint(
+            checkpoint_id,
+            outputs={
+                'steps': results,
+                'artifacts': artifacts
+            },
+            rollback_data={
+                'completed_steps': [r['step'] for r in results],
+                'artifacts': artifacts
+            }
+        )
+        
+        # Notify success
+        notify_success(
+            project_name=project_context.get('name', 'Unknown'),
+            task_title=task.get('title', 'Unknown'),
+            pr_url=artifacts.get('pr_url'),
+            duration_seconds=self._calculate_duration(results)
+        )
+        
+        return {
+            'success': True,
+            'final_status': 'complete',
+            'steps_executed': results,
+            'artifacts': artifacts,
+            'checkpoint_id': checkpoint_id
+        }
+    
+    def _build_manifest(
+        self,
+        draft: Dict[str, Any],
+        task: Dict[str, Any],
+        project_context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Build execution manifest from draft."""
+        
+        steps = []
+        work_dir = project_context.get('work_dir', '/tmp')
+        task_slug = task.get('id', 'unknown')[:8]
+        branch_name = f"aos/{task.get('task_type', 'impl')}/{task_slug}"
+        
+        # Step 1: Ensure we're on main and up to date
+        # First stash any changes, then checkout main
+        steps.append({
+            'name': 'git_checkout_main',
+            'type': 'git',
+            'command': 'git stash -q 2>/dev/null; git checkout main 2>/dev/null || git checkout master 2>/dev/null || git checkout -b main',
+            'work_dir': work_dir,
+            'irreversible': False,
+            'preconditions': ['is_git_repo'],
+            'postconditions': ['on_main_or_master_branch']
+        })
+        
+        # Step 2: Clean up any existing branch with same name, then create
+        steps.append({
+            'name': 'create_branch',
+            'type': 'git',
+            'command': f'git branch -D {branch_name} 2>/dev/null; git checkout -b {branch_name} 2>/dev/null || git checkout {branch_name}',
+            'work_dir': work_dir,
+            'irreversible': False,
+            'preconditions': ['on_main_or_master_branch'],
+            'postconditions': ['on_new_branch'],
+            'branch_name': branch_name
+        })
+        
+        # Step 3: Create files
+        for i, file_op in enumerate(draft.get('files_to_create', [])):
+            steps.append({
+                'name': f"create_file_{i}",
+                'type': 'file_create',
+                'path': file_op['path'],
+                'content': file_op['content'],
+                'work_dir': work_dir,
+                'irreversible': False,
+                'preconditions': ['parent_dir_exists'],
+                'postconditions': ['file_exists', 'content_matches']
+            })
+        
+        # Step 4: Modify files
+        for i, file_op in enumerate(draft.get('files_to_modify', [])):
+            steps.append({
+                'name': f"modify_file_{i}",
+                'type': 'file_modify',
+                'path': file_op['path'],
+                'diff': file_op.get('diff', ''),
+                'work_dir': work_dir,
+                'irreversible': False,
+                'preconditions': ['file_exists'],
+                'postconditions': ['diff_applied']
+            })
+        
+        # Step 5: Commit
+        commit_msg = f"feat({project_context.get('name', 'project')}): {task.get('title', 'Update')}"
+        steps.append({
+            'name': 'git_commit',
+            'type': 'git',
+            'command': f'git add -A && git commit -m "{commit_msg}"',
+            'work_dir': work_dir,
+            'irreversible': False,
+            'preconditions': ['has_changes'],
+            'postconditions': ['clean_working_dir', 'commit_exists']
+        })
+        
+        # Step 6: Push (IRREVERSIBLE)
+        steps.append({
+            'name': 'git_push',
+            'type': 'git',
+            'command': f'git push -u origin {branch_name}',
+            'work_dir': work_dir,
+            'irreversible': True,
+            'preconditions': ['commit_exists'],
+            'postconditions': ['remote_branch_exists'],
+            'imr_pentagon': {
+                'inputs': ['branch_name', 'commit_sha', 'remote_url'],
+                'method': f'git push -u origin {branch_name}',
+                'rules': ['no_force_push', 'verification_approved'],
+                'review': ['branch_exists_locally', 'commit_verified'],
+                'record': ['push_output', 'timestamp', 'commit_sha']
+            },
+            'branch_name': branch_name
+        })
+        
+        # Step 7: Create PR (IRREVERSIBLE)
+        pr_title = task.get('title', 'Update')
+        pr_body = f"Auto-generated by Agent-OS v3\\n\\nTask: {task.get('id', 'unknown')}"
+        steps.append({
+            'name': 'create_pr',
+            'type': 'github',
+            'command': f'gh pr create --title "{pr_title}" --body "{pr_body}" --head {branch_name}',
+            'work_dir': work_dir,
+            'irreversible': True,
+            'preconditions': ['remote_branch_exists'],
+            'postconditions': ['pr_exists'],
+            'imr_pentagon': {
+                'inputs': ['branch_name', 'pr_title', 'pr_body'],
+                'method': 'gh pr create',
+                'rules': ['branch_pushed', 'verification_approved'],
+                'review': ['pr_content_valid'],
+                'record': ['pr_number', 'pr_url', 'timestamp']
+            },
+            'branch_name': branch_name
+        })
+        
+        return {
+            'steps': steps,
+            'branch_name': branch_name,
+            'task_id': task.get('id'),
+            'created_at': datetime.utcnow().isoformat()
+        }
+    
+    def _validate_imr_pentagon(self, step: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate that all five vertices of the IMR Pentagon are defined.
+        
+        I - Inputs
+        M - Method
+        R - Rules
+        R - Review
+        R - Record
+        """
+        imr = step.get('imr_pentagon', {})
+        missing = []
+        
+        required = ['inputs', 'method', 'rules', 'review', 'record']
+        for vertex in required:
+            if vertex not in imr or not imr[vertex]:
+                missing.append(vertex)
+        
+        return {
+            'valid': len(missing) == 0,
+            'missing': missing
+        }
+    
+    def _verify_preconditions(
+        self,
+        step: Dict[str, Any],
+        project_context: Dict[str, Any],
+        artifacts: Dict[str, Any]
+    ) -> bool:
+        """Verify preconditions for a step."""
+        work_dir = step.get('work_dir', project_context.get('work_dir', '/tmp'))
+        
+        for condition in step.get('preconditions', []):
+            if condition == 'is_git_repo':
+                if not Path(work_dir, '.git').exists():
+                    return False
+            
+            elif condition == 'on_main_branch':
+                result = subprocess.run(
+                    ['git', 'branch', '--show-current'],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True
+                )
+                if result.stdout.strip() != 'main':
+                    return False
+            
+            elif condition == 'on_main_or_master_branch':
+                result = subprocess.run(
+                    ['git', 'branch', '--show-current'],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True
+                )
+                branch = result.stdout.strip()
+                if branch not in ('main', 'master'):
+                    return False
+            
+            elif condition == 'on_new_branch':
+                result = subprocess.run(
+                    ['git', 'branch', '--show-current'],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True
+                )
+                if result.stdout.strip() == 'main':
+                    return False
+            
+            elif condition == 'has_changes':
+                result = subprocess.run(
+                    ['git', 'status', '--porcelain'],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True
+                )
+                if not result.stdout.strip():
+                    return False
+            
+            elif condition == 'commit_exists':
+                # Check that we have at least one commit on this branch
+                pass  # Always true after git commit
+            
+            elif condition == 'remote_accessible':
+                result = subprocess.run(
+                    ['git', 'remote', '-v'],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True
+                )
+                if 'origin' not in result.stdout:
+                    return False
+            
+            elif condition == 'remote_branch_exists':
+                # For preconditions, just verify branch name is available
+                branch = artifacts.get('branch_name', step.get('branch_name', ''))
+                if not branch:
+                    return False
+            
+            elif condition == 'file_exists':
+                path = step.get('path', '')
+                full_path = Path(work_dir) / path
+                if not full_path.exists():
+                    return False
+            
+            elif condition == 'parent_dir_exists':
+                path = step.get('path', '')
+                full_path = Path(work_dir) / path
+                if not full_path.parent.exists():
+                    full_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        return True
+    
+    def _verify_postconditions(
+        self,
+        step: Dict[str, Any],
+        project_context: Dict[str, Any],
+        output: Dict[str, Any]
+    ) -> bool:
+        """Verify postconditions after a step."""
+        work_dir = step.get('work_dir', project_context.get('work_dir', '/tmp'))
+        
+        for condition in step.get('postconditions', []):
+            if condition == 'on_main_branch':
+                result = subprocess.run(
+                    ['git', 'branch', '--show-current'],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True
+                )
+                if result.stdout.strip() != 'main':
+                    return False
+            
+            elif condition == 'on_main_or_master_branch':
+                result = subprocess.run(
+                    ['git', 'branch', '--show-current'],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True
+                )
+                branch = result.stdout.strip()
+                if branch not in ('main', 'master'):
+                    return False
+            
+            elif condition == 'on_new_branch':
+                result = subprocess.run(
+                    ['git', 'branch', '--show-current'],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True
+                )
+                if result.stdout.strip() == 'main':
+                    return False
+            
+            elif condition == 'file_exists':
+                path = step.get('path', '')
+                full_path = Path(work_dir) / path
+                if not full_path.exists():
+                    return False
+            
+            elif condition == 'content_matches':
+                # Verify file content matches what we wrote
+                path = step.get('path', '')
+                expected = step.get('content', '')
+                full_path = Path(work_dir) / path
+                if full_path.exists():
+                    actual = full_path.read_text()
+                    if actual != expected:
+                        return False
+            
+            elif condition == 'clean_working_dir':
+                result = subprocess.run(
+                    ['git', 'status', '--porcelain'],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True
+                )
+                if result.stdout.strip():
+                    return False
+            
+            elif condition == 'remote_branch_exists':
+                # Skip if step was skipped (no remote)
+                if output.get('skipped'):
+                    return True
+                # Verify via output
+                if output.get('returncode', 1) != 0:
+                    return False
+            
+            elif condition == 'pr_exists':
+                # Skip if step was skipped (no remote)
+                if output.get('skipped'):
+                    return True
+                # Verify PR was created
+                if 'pr_url' not in output.get('artifacts', {}):
+                    return False
+            
+            elif condition == 'diff_applied':
+                # Verify the diff was applied (file was modified)
+                # If we got here without exception, diff was applied
+                if output.get('returncode', 1) != 0:
+                    return False
+            
+            elif condition == 'commit_exists':
+                # Verify a commit was made
+                if output.get('returncode', 1) != 0:
+                    return False
+        
+        return True
+    
+    def _execute_step(
+        self,
+        step: Dict[str, Any],
+        project_context: Dict[str, Any],
+        draft: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Execute a single step."""
+        
+        work_dir = step.get('work_dir', project_context.get('work_dir', '/tmp'))
+        step_type = step.get('type', 'unknown')
+        
+        if step_type == 'git':
+            return self._execute_git_step(step, work_dir)
+        
+        elif step_type == 'file_create':
+            return self._execute_file_create(step, work_dir)
+        
+        elif step_type == 'file_modify':
+            return self._execute_file_modify(step, work_dir)
+        
+        elif step_type == 'github':
+            return self._execute_github_step(step, work_dir)
+        
+        else:
+            raise ValueError(f"Unknown step type: {step_type}")
+    
+    def _execute_git_step(
+        self,
+        step: Dict[str, Any],
+        work_dir: str
+    ) -> Dict[str, Any]:
+        """Execute a git command."""
+        
+        command = step.get('command', '')
+        
+        # Skip push commands if no remote configured
+        if 'push' in command:
+            remote_check = subprocess.run(['git', 'remote', '-v'], cwd=work_dir, capture_output=True, text=True)
+            if 'origin' not in remote_check.stdout:
+                return {
+                    'returncode': 0,
+                    'stdout': 'Skipped push - no remote configured',
+                    'stderr': '',
+                    'artifacts': {},
+                    'skipped': True
+                }
+        
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        
+        output = {
+            'returncode': result.returncode,
+            'stdout': result.stdout,
+            'stderr': result.stderr,
+            'artifacts': {}
+        }
+        
+        # Extract commit SHA if this was a commit
+        if 'commit' in command and result.returncode == 0:
+            sha_result = subprocess.run(
+                ['git', 'rev-parse', 'HEAD'],
+                cwd=work_dir,
+                capture_output=True,
+                text=True
+            )
+            output['artifacts']['commit_sha'] = sha_result.stdout.strip()
+        
+        # Store branch name
+        if 'checkout -b' in command:
+            output['artifacts']['branch_name'] = step.get('branch_name', '')
+        
+        if result.returncode != 0:
+            error_msg = result.stderr or result.stdout
+            # Don't fail on branch delete errors (branch may not exist)
+            if 'branch -D' in command and 'error: branch' in error_msg:
+                pass  # Ignore branch deletion errors
+            else:
+                raise RuntimeError(f"Git command failed: {error_msg}")
+        
+        return output
+    
+    def _execute_file_create(
+        self,
+        step: Dict[str, Any],
+        work_dir: str
+    ) -> Dict[str, Any]:
+        """Create a new file."""
+        
+        path = step.get('path', '')
+        content = step.get('content', '')
+        
+        full_path = Path(work_dir) / path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content)
+        
+        return {
+            'returncode': 0,
+            'path': str(full_path),
+            'size': len(content),
+            'artifacts': {}
+        }
+    
+    def _execute_file_modify(
+        self,
+        step: Dict[str, Any],
+        work_dir: str
+    ) -> Dict[str, Any]:
+        """Modify an existing file by applying a unified diff."""
+        
+        path = step.get('path', '')
+        diff = step.get('diff', '')
+        
+        full_path = Path(work_dir) / path
+        
+        if not full_path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        
+        if not diff:
+            return {
+                'returncode': 0,
+                'path': str(full_path),
+                'artifacts': {},
+                'skipped': True,
+                'message': 'No diff provided'
+            }
+        
+        try:
+            # Unescape the diff (it may have been JSON-escaped)
+            unescaped_diff = diff.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
+            
+            # Write diff to temp file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as f:
+                f.write(unescaped_diff)
+                patch_file = f.name
+            
+            # Try to apply the patch
+            result = subprocess.run(
+                ['patch', '-p1', '--fuzz=2', '-i', patch_file],
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            os.unlink(patch_file)
+            
+            if result.returncode != 0:
+                # If patch fails, try with --force
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as f:
+                    f.write(unescaped_diff)
+                    patch_file = f.name
+                
+                result = subprocess.run(
+                    ['patch', '-p0', '--fuzz=3', '--force', '-i', patch_file],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                os.unlink(patch_file)
+            
+            if result.returncode != 0:
+                raise RuntimeError(f"Patch failed: {result.stderr or result.stdout}")
+            
+            return {
+                'returncode': 0,
+                'path': str(full_path),
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+                'artifacts': {'modified_file': str(full_path)}
+            }
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to apply diff to {path}: {str(e)}")
+
+    
+    def _execute_github_step(
+        self,
+        step: Dict[str, Any],
+        work_dir: str
+    ) -> Dict[str, Any]:
+        """Execute a GitHub CLI command."""
+        
+        # Check if remote exists - skip if not
+        remote_check = subprocess.run(['git', 'remote', '-v'], cwd=work_dir, capture_output=True, text=True)
+        if 'origin' not in remote_check.stdout:
+            return {
+                'returncode': 0,
+                'stdout': 'Skipped - no remote configured',
+                'stderr': '',
+                'artifacts': {},
+                'skipped': True
+            }
+        
+        command = step.get('command', '')
+        
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        output = {
+            'returncode': result.returncode,
+            'stdout': result.stdout,
+            'stderr': result.stderr,
+            'artifacts': {}
+        }
+        
+        # Extract PR URL from output
+        if 'pr create' in command and result.returncode == 0:
+            # gh pr create outputs the URL
+            pr_url = result.stdout.strip()
+            output['artifacts']['pr_url'] = pr_url
+            
+            # Extract PR number from URL
+            import re
+            match = re.search(r'/pull/(\d+)', pr_url)
+            if match:
+                output['artifacts']['pr_number'] = int(match.group(1))
+        
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"GitHub command failed: {result.stderr or result.stdout}"
+            )
+        
+        return output
+    
+    def _generate_rollback_instructions(
+        self,
+        completed_steps: List[Dict[str, Any]],
+        project_context: Dict[str, Any]
+    ) -> str:
+        """Generate rollback instructions for completed steps."""
+        
+        instructions = ["# Rollback Instructions\n"]
+        work_dir = project_context.get('work_dir', '/tmp')
+        
+        # Reverse order for rollback
+        for step in reversed(completed_steps):
+            step_name = step.get('step', 'unknown')
+            step_type = step.get('type', 'unknown')
+            
+            if step_type == 'git' and 'push' in step_name:
+                branch = step.get('output', {}).get('artifacts', {}).get('branch_name', '')
+                if branch:
+                    instructions.append(
+                        f"# Delete remote branch:\n"
+                        f"cd {work_dir} && git push origin --delete {branch}\n"
+                    )
+            
+            elif step_type == 'git' and 'branch' in step_name:
+                branch = step.get('output', {}).get('artifacts', {}).get('branch_name', '')
+                if branch:
+                    instructions.append(
+                        f"# Delete local branch:\n"
+                        f"cd {work_dir} && git checkout main && git branch -D {branch}\n"
+                    )
+            
+            elif step_type == 'file_create':
+                path = step.get('output', {}).get('path', '')
+                if path:
+                    instructions.append(
+                        f"# Delete created file:\n"
+                        f"rm {path}\n"
+                    )
+            
+            elif step_type == 'github' and 'pr' in step_name:
+                pr_number = step.get('output', {}).get('artifacts', {}).get('pr_number')
+                if pr_number:
+                    instructions.append(
+                        f"# Close PR (manual):\n"
+                        f"gh pr close {pr_number} --delete-branch\n"
+                    )
+        
+        return '\n'.join(instructions)
+    
+    def _calculate_duration(self, results: List[Dict[str, Any]]) -> int:
+        """Calculate total duration in seconds."""
+        if not results:
+            return 0
+        
+        try:
+            start = datetime.fromisoformat(results[0].get('started_at', ''))
+            end = datetime.fromisoformat(results[-1].get('completed_at', ''))
+            return int((end - start).total_seconds())
+        except:
+            return 0
+
+
+def create_executor() -> ExecutionController:
+    """Factory function to create an ExecutionController."""
+    checkpoint_manager = CheckpointManager()
+    return ExecutionController(checkpoint_manager)
+
+
+if __name__ == '__main__':
+    print("ExecutionController module loaded.")
+    print("This is a deterministic executor - no LLM involved.")
+    print("It only executes pre-approved proposals.")

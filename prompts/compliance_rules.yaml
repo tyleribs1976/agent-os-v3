@@ -1,0 +1,45 @@
+# Agent-OS v3 Compliance Rules
+# These rules are enforced by the Compliance role
+
+rules:
+  - name: security_review
+    trigger: "Any security risk_flag present"
+    action: human_review_required
+    
+  - name: budget_check
+    trigger: "Project cost > 80% of budget"
+    action: human_review_required
+    
+  - name: breaking_change
+    trigger: "breaking_change risk_flag present"
+    action: human_review_required
+    
+  - name: external_api
+    trigger: "Changes to external API integrations"
+    action: human_review_required
+    
+  - name: database_migration
+    trigger: "Database schema changes detected"
+    action: blocked_until_migration_plan_reviewed
+    
+  - name: credential_exposure
+    trigger: "Potential credential or secret in code"
+    action: blocked_always
+    
+  - name: force_push
+    trigger: "Attempt to force push"
+    action: blocked_always
+
+escalation:
+  default:
+    - channel: telegram
+      priority: normal
+    - channel: pushover
+      priority: high
+      
+  security:
+    - channel: telegram
+      priority: urgent
+    - channel: pushover
+      priority: emergency
+      sound: siren

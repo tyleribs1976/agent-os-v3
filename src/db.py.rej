@@ -1,0 +1,35 @@
+--- src/db.py
++++ src/db.py
+@@ -50,11 +50,31 @@
+ 
+ @contextmanager
+ def get_connection():
+     """
+-    Get a database connection from the pool.
++    Get a database connection from the pool using context manager pattern.
++    
++    This function implements the context manager protocol to safely acquire and
++    release database connections from the ThreadedConnectionPool. Connections are
++    automatically returned to the pool when the context exits, even if an exception
++    occurs.
++    
++    Connection Pooling:
++        - Connections are managed by psycopg2.pool.ThreadedConnectionPool
++        - Pool is initialized lazily on first use with min=2, max=10 connections
++        - Connections are thread-safe and automatically recycled
++        - Pool prevents connection exhaustion and manages lifecycle
++    
++    When to Use:
++        - Use this when you need direct connection control for transactions
++        - Prefer get_cursor() for simple queries with auto-commit
++        - Prefer transaction() for multi-statement transactions with rollback
++    
++    Yields:
++        psycopg2.extensions.connection: A database connection from the pool
+     
+     Usage:
+         with get_connection() as conn:
+             with conn.cursor() as cur:
+                 cur.execute("SELECT 1")
++                conn.commit()  # Manual commit required
+     """
