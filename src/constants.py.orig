@@ -11,11 +11,17 @@ DESCRIPTION = "Agent-OS v3 Autonomous Development System"
 GITHUB_REPO = "agent-os-v3"
 HOMEPAGE = "https://github.com/tyfiero/agent-os-v3"
 
+# Git configuration
+GIT_BRANCH_PREFIX = "aos"
+
 # Logging configuration
 LOG_LEVEL = "INFO"
 
 # Test constant for GitHub PR verification
 TESTED = True
+
+# PR configuration
+PR_AUTO_MERGE = False
 
 # Task statuses
 STATUS_QUEUED = "queued"

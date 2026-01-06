@@ -45,6 +45,9 @@ DEFAULT_TIMEOUT = 300
 VERIFY_TIMEOUT = 300
 EXECUTE_TIMEOUT = 300
 
+# Retry configuration
+MAX_RETRIES = 3
+
 # Error codes
 ERROR_CODES = {
     "E001": "TASK_NOT_FOUND",
