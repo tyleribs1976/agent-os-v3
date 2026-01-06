@@ -17,6 +17,9 @@ LOG_LEVEL = "INFO"
 # Test constant for GitHub PR verification
 TESTED = True
 
+# PR configuration
+PR_AUTO_MERGE = False
+
 # Task statuses
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
