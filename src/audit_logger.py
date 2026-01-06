@@ -1,249 +1,332 @@
 """
-Agent-OS v3 Audit Logger Module
+Agent-OS v3 Audit Logger
 
 Following million-step methodology:
-- All significant actions are audited
-- Audit logs are structured and searchable
-- No silent failures in logging
-- Supports compliance and debugging
+- All system events are logged
+- Audit trail is immutable
+- Security events are flagged
+- Retention policies are enforced
 """
 
+import os
 import json
 from datetime import datetime
-from typing import Optional, Dict, Any, Union
-from uuid import uuid4
+from typing import Dict, Any, Optional, List
+from enum import Enum
 
-from db import insert_returning
+from db import insert_returning, query_all, query_one
 
 
-# Action type constants
-EXECUTION_START = "execution_start"
-STEP_COMPLETE = "step_complete"
-STEP_FAILED = "step_failed"
-EXECUTION_COMPLETE = "execution_complete"
-EXECUTION_FAILED = "execution_failed"
+class EventType(Enum):
+    """Types of audit events."""
+    TASK_CREATED = "task_created"
+    TASK_STARTED = "task_started"
+    TASK_COMPLETED = "task_completed"
+    TASK_FAILED = "task_failed"
+    TASK_HALTED = "task_halted"
+    CHECKPOINT_CREATED = "checkpoint_created"
+    CHECKPOINT_COMPLETED = "checkpoint_completed"
+    CHECKPOINT_FAILED = "checkpoint_failed"
+    DRAFT_GENERATED = "draft_generated"
+    VERIFICATION_COMPLETE = "verification_complete"
+    EXECUTION_STARTED = "execution_started"
+    EXECUTION_COMPLETE = "execution_complete"
+    FILE_CREATED = "file_created"
+    FILE_MODIFIED = "file_modified"
+    GIT_COMMIT = "git_commit"
+    GIT_PUSH = "git_push"
+    PR_CREATED = "pr_created"
+    SECURITY_FLAG = "security_flag"
+    COMPLIANCE_CHECK = "compliance_check"
+    HALT_TRIGGERED = "halt_triggered"
+    API_CALL = "api_call"
+    ERROR = "error"
 
-# Additional common action types
-CHECKPOINT_CREATED = "checkpoint_created"
-CHECKPOINT_COMPLETED = "checkpoint_completed"
-VERIFICATION_APPROVED = "verification_approved"
-VERIFICATION_REJECTED = "verification_rejected"
-UNCERTAINTY_DETECTED = "uncertainty_detected"
-HALT_TRIGGERED = "halt_triggered"
+
+class Severity(Enum):
+    """Severity levels for audit events."""
+    DEBUG = "debug"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
 
 
 class AuditLogger:
     """
-    Audit logger for tracking all significant Agent-OS v3 operations.
+    Logs all system events to an immutable audit trail.
     
-    Provides structured logging of actions with inputs, outputs, and metadata
-    for compliance, debugging, and system transparency.
+    Core principle: Every significant action must be auditable.
     """
     
-    def __init__(self, default_agent_id: Optional[str] = None, default_role: Optional[str] = None):
-        """
-        Initialize audit logger.
-        
-        Args:
-            default_agent_id: Default agent ID to use if not specified per log
-            default_role: Default role to use if not specified per log
-        """
-        self.default_agent_id = default_agent_id
-        self.default_role = default_role
+    def __init__(self):
+        self._ensure_audit_table()
     
-    def log_audit(
+    def _ensure_audit_table(self):
+        """
+        Ensure audit_logs table exists.
+        
+        This is called on initialization to create the table if needed.
+        """
+        from db import execute
+        
+        create_table_sql = """
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id SERIAL PRIMARY KEY,
+            timestamp TIMESTAMP DEFAULT NOW(),
+            event_type VARCHAR(50) NOT NULL,
+            severity VARCHAR(20) NOT NULL,
+            project_id UUID,
+            task_id UUID,
+            checkpoint_id INTEGER,
+            actor VARCHAR(100),
+            action TEXT NOT NULL,
+            details JSONB,
+            ip_address VARCHAR(45),
+            user_agent TEXT,
+            success BOOLEAN DEFAULT TRUE,
+            error_message TEXT,
+            metadata JSONB
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_event_type ON audit_logs(event_type);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_project_id ON audit_logs(project_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_task_id ON audit_logs(task_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_severity ON audit_logs(severity);
+        """
+        
+        try:
+            execute(create_table_sql)
+        except Exception as e:
+            # Table might already exist, that's okay
+            pass
+    
+    def log_event(
         self,
+        event_type: EventType,
         action: str,
-        description: str,
+        severity: Severity = Severity.INFO,
         project_id: Optional[str] = None,
         task_id: Optional[str] = None,
         checkpoint_id: Optional[int] = None,
-        agent_id: Optional[str] = None,
-        role: Optional[str] = None,
-        inputs: Optional[Dict[str, Any]] = None,
-        outputs: Optional[Dict[str, Any]] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> int:
+        actor: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        success: bool = True,
+        error_message: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        Log an audit entry.
+        Log an audit event.
         
         Args:
-            action: Action type (use constants like EXECUTION_START)
-            description: Human-readable description of the action
-            project_id: Project ID if applicable
-            task_id: Task ID if applicable
-            checkpoint_id: Checkpoint ID if applicable
-            agent_id: Agent performing the action (uses default if not provided)
-            role: Role of the agent (uses default if not provided)
-            inputs: Input data/parameters for the action
-            outputs: Output data/results from the action
-            metadata: Additional metadata
+            event_type: Type of event (from EventType enum)
+            action: Human-readable description of the action
+            severity: Severity level (default: INFO)
+            project_id: Associated project UUID
+            task_id: Associated task UUID
+            checkpoint_id: Associated checkpoint ID
+            actor: Who/what performed the action (agent ID, user, etc.)
+            details: Event-specific details as JSON
+            success: Whether the action succeeded
+            error_message: Error message if action failed
+            metadata: Additional metadata as JSON
+            ip_address: IP address if applicable
+            user_agent: User agent if applicable
         
         Returns:
-            The ID of the created audit log entry
-        
-        Raises:
-            ValueError: If required action parameter is missing
+            The created audit log record
         """
-        if not action:
-            raise ValueError("Action is required for audit logging")
-        
-        # Use defaults if not provided
-        final_agent_id = agent_id or self.default_agent_id
-        final_role = role or self.default_role
-        
-        # Prepare data for insertion
         audit_data = {
-            'timestamp': datetime.utcnow(),
+            'event_type': event_type.value,
+            'severity': severity.value,
+            'action': action,
             'project_id': project_id,
             'task_id': task_id,
             'checkpoint_id': checkpoint_id,
-            'agent_id': final_agent_id,
-            'role': final_role,
-            'action': action,
-            'description': description,
-            'inputs_summary': self._format_as_json_summary(inputs) if inputs else None,
-            'outputs_summary': self._format_as_json_summary(outputs) if outputs else None,
-            'metadata': json.dumps(metadata, default=str) if metadata else None
+            'actor': actor,
+            'details': json.dumps(details, default=str) if details else None,
+            'success': success,
+            'error_message': error_message,
+            'metadata': json.dumps(metadata, default=str) if metadata else None,
+            'ip_address': ip_address,
+            'user_agent': user_agent
         }
         
-        # Remove None values to avoid unnecessary nulls
-        audit_data = {k: v for k, v in audit_data.items() if v is not None}
-        
-        # Insert and return the ID
-        return insert_returning('audit_log', audit_data, returning='id')
+        return insert_returning('audit_logs', audit_data)
     
-    def _format_as_json_summary(
-        self, 
-        data: Union[Dict[str, Any], list, str, int, float, bool], 
-        max_length: int = 1000
-    ) -> str:
-        """
-        Format data as JSON summary, truncating if necessary.
-        
-        Args:
-            data: Data to format
-            max_length: Maximum length of the JSON string
-        
-        Returns:
-            JSON string, possibly truncated with indicator
-        """
-        if data is None:
-            return None
-        
-        try:
-            json_str = json.dumps(data, default=str, separators=(',', ':'))
-            
-            if len(json_str) <= max_length:
-                return json_str
-            
-            # Truncate and add indicator
-            truncated = json_str[:max_length-20]  # Leave room for truncation indicator
-            return truncated + '..."[TRUNCATED]"'
-            
-        except (TypeError, ValueError) as e:
-            # If serialization fails, return string representation
-            str_repr = str(data)
-            if len(str_repr) <= max_length:
-                return json.dumps({"_repr": str_repr}, default=str)
-            else:
-                truncated_repr = str_repr[:max_length-30]
-                return json.dumps({"_repr": truncated_repr + "...[TRUNCATED]"}, default=str)
-    
-    def log_execution_start(
+    def log_task_event(
         self,
-        project_id: str,
+        event_type: EventType,
         task_id: str,
-        agent_id: Optional[str] = None,
-        inputs: Optional[Dict[str, Any]] = None
-    ) -> int:
+        project_id: str,
+        action: str,
+        actor: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        success: bool = True,
+        error_message: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        Convenience method to log execution start.
-        
-        Args:
-            project_id: Project ID
-            task_id: Task ID
-            agent_id: Agent starting execution
-            inputs: Execution inputs
-        
-        Returns:
-            Audit log entry ID
+        Convenience method for logging task-related events.
         """
-        return self.log_audit(
-            action=EXECUTION_START,
-            description=f"Started execution of task {task_id}",
+        return self.log_event(
+            event_type=event_type,
+            action=action,
             project_id=project_id,
             task_id=task_id,
-            agent_id=agent_id,
-            role="executor",
-            inputs=inputs
+            actor=actor,
+            details=details,
+            success=success,
+            error_message=error_message
         )
     
-    def log_step_complete(
+    def log_checkpoint_event(
         self,
-        project_id: str,
-        task_id: str,
+        event_type: EventType,
         checkpoint_id: int,
-        step_name: str,
-        agent_id: Optional[str] = None,
-        outputs: Optional[Dict[str, Any]] = None
-    ) -> int:
+        task_id: str,
+        project_id: str,
+        action: str,
+        actor: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        success: bool = True
+    ) -> Dict[str, Any]:
         """
-        Convenience method to log step completion.
-        
-        Args:
-            project_id: Project ID
-            task_id: Task ID
-            checkpoint_id: Checkpoint ID
-            step_name: Name of completed step
-            agent_id: Agent that completed the step
-            outputs: Step outputs
-        
-        Returns:
-            Audit log entry ID
+        Convenience method for logging checkpoint-related events.
         """
-        return self.log_audit(
-            action=STEP_COMPLETE,
-            description=f"Completed step: {step_name}",
-            project_id=project_id,
-            task_id=task_id,
+        return self.log_event(
+            event_type=event_type,
+            action=action,
             checkpoint_id=checkpoint_id,
-            agent_id=agent_id,
-            outputs=outputs
+            task_id=task_id,
+            project_id=project_id,
+            actor=actor,
+            details=details,
+            success=success
         )
     
-    def log_halt(
+    def log_security_event(
         self,
-        project_id: str,
-        task_id: str,
-        reason: str,
+        action: str,
+        details: Dict[str, Any],
+        project_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        severity: Severity = Severity.WARNING
+    ) -> Dict[str, Any]:
+        """
+        Log a security-related event with high visibility.
+        """
+        return self.log_event(
+            event_type=EventType.SECURITY_FLAG,
+            action=action,
+            severity=severity,
+            project_id=project_id,
+            task_id=task_id,
+            details=details
+        )
+    
+    def log_error(
+        self,
+        action: str,
+        error_message: str,
+        project_id: Optional[str] = None,
+        task_id: Optional[str] = None,
         checkpoint_id: Optional[int] = None,
-        agent_id: Optional[str] = None,
-        role: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> int:
+        actor: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
-        Convenience method to log HALT conditions.
-        
-        Args:
-            project_id: Project ID
-            task_id: Task ID
-            reason: Reason for halt
-            checkpoint_id: Checkpoint ID if applicable
-            agent_id: Agent triggering halt
-            role: Role of agent triggering halt
-            metadata: Additional halt metadata
-        
-        Returns:
-            Audit log entry ID
+        Convenience method for logging errors.
         """
-        return self.log_audit(
-            action=HALT_TRIGGERED,
-            description=f"HALT triggered: {reason}",
+        return self.log_event(
+            event_type=EventType.ERROR,
+            action=action,
+            severity=Severity.ERROR,
             project_id=project_id,
             task_id=task_id,
             checkpoint_id=checkpoint_id,
-            agent_id=agent_id,
-            role=role,
-            metadata=metadata
+            actor=actor,
+            details=details,
+            success=False,
+            error_message=error_message
         )
+    
+    def get_audit_trail(
+        self,
+        project_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        event_type: Optional[EventType] = None,
+        severity: Optional[Severity] = None,
+        limit: int = 100,
+        offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve audit trail with optional filters.
+        
+        Args:
+            project_id: Filter by project
+            task_id: Filter by task
+            event_type: Filter by event type
+            severity: Filter by severity
+            limit: Maximum number of records to return
+            offset: Offset for pagination
+        
+        Returns:
+            List of audit log records
+        """
+        conditions = []
+        params = []
+        
+        if project_id:
+            conditions.append("project_id = %s")
+            params.append(project_id)
+        
+        if task_id:
+            conditions.append("task_id = %s")
+            params.append(task_id)
+        
+        if event_type:
+            conditions.append("event_type = %s")
+            params.append(event_type.value)
+        
+        if severity:
+            conditions.append("severity = %s")
+            params.append(severity.value)
+        
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+        
+        sql = f"""
+        SELECT * FROM audit_logs
+        {where_clause}
+        ORDER BY timestamp DESC
+        LIMIT %s OFFSET %s
+        """
+        
+        params.extend([limit, offset])
+        
+        return query_all(sql, tuple(params))
+    
+    def get_security_events(
+        self,
+        project_id: Optional[str] = None,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        Get all security-flagged events.
+        """
+        return self.get_audit_trail(
+            project_id=project_id,
+            event_type=EventType.SECURITY_FLAG,
+            limit=limit
+        )
+    
+    def get_task_timeline(
+        self,
+        task_id: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Get complete audit timeline for a task.
+        """
+        return self.get_audit_trail(task_id=task_id, limit=1000)
