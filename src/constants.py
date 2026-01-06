@@ -14,6 +14,9 @@ HOMEPAGE = "https://github.com/tyfiero/agent-os-v3"
 # Logging configuration
 LOG_LEVEL = "INFO"
 
+# Test constant for GitHub PR verification
+TESTED = True
+
 # Task statuses
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
