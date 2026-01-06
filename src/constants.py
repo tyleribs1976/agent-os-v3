@@ -11,6 +11,9 @@ DESCRIPTION = "Agent-OS v3 Autonomous Development System"
 GITHUB_REPO = "agent-os-v3"
 HOMEPAGE = "https://github.com/tyfiero/agent-os-v3"
 
+# Git configuration
+GIT_BRANCH_PREFIX = "aos"
+
 # Logging configuration
 LOG_LEVEL = "INFO"
 
