@@ -37,6 +37,7 @@ PHASE_EXECUTION = "execution"
 
 # Confidence thresholds
 MIN_DRAFTER_CONFIDENCE = 0.85
+CONFIDENCE_THRESHOLD = 0.85
 MIN_VERIFIER_CONFIDENCE = 0.90
 
 # Timeout settings (seconds)
