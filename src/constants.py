@@ -39,6 +39,9 @@ PHASE_EXECUTION = "execution"
 MIN_DRAFTER_CONFIDENCE = 0.85
 MIN_VERIFIER_CONFIDENCE = 0.90
 
+# Model configuration
+VERIFIER_MODEL = "claude-sonnet-4-20250514"
+
 # Timeout settings (seconds)
 DRAFT_TIMEOUT = 600
 DEFAULT_TIMEOUT = 300
