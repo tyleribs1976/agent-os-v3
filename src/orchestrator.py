@@ -126,7 +126,13 @@ class TaskOrchestrator:
         
         # Priority files to always include
         priority_files = [
+            'src/constants.py',
             'src/db.py',
+            'src/validators.py',
+            'src/helpers.py',
+            'src/utils.py',
+            'src/models.py',
+            'src/exceptions.py',
             'src/checkpoints.py', 
             'src/orchestrator.py',
             'src/uncertainty.py',
