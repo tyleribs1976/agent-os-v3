@@ -1,0 +1,33 @@
+# GitHub Configuration for Agent-OS v3
+# This file contains repository-specific settings for GitHub integration
+
+# Repository information
+repo:
+  owner: tyleribs1976
+  name: agent-os
+
+# Branch configuration
+branches:
+  default: main
+  prefix: aos
+
+# Pull request settings
+pull_requests:
+  auto_merge: false
+  default_reviewers: []
+  labels:
+    - agent-os-v3
+    - automated
+
+# GitHub Actions integration
+actions:
+  enabled: true
+  wait_for_checks: true
+
+# Commit settings
+commits:
+  sign: false
+  gpg_key: null
+  author:
+    name: Agent-OS v3
+    email: noreply@agent-os.dev
