@@ -43,7 +43,6 @@ DRAFTER_MODEL = "claude-sonnet-4-20250514"
 
 # Confidence thresholds
 MIN_DRAFTER_CONFIDENCE = 0.85
-CONFIDENCE_THRESHOLD = 0.85
 MIN_VERIFIER_CONFIDENCE = 0.90
 
 # Model configuration

@@ -14,6 +14,9 @@ HOMEPAGE = "https://github.com/tyfiero/agent-os-v3"
 # Git configuration
 GIT_BRANCH_PREFIX = "aos"
 
+# GitHub integration
+GITHUB_INTEGRATION = "enabled"
+
 # Logging configuration
 LOG_LEVEL = "INFO"
 
