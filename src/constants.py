@@ -41,6 +41,9 @@ PHASE_EXECUTION = "execution"
 # Model configuration
 DRAFTER_MODEL = "claude-sonnet-4-20250514"
 
+# Default model for general operations
+DEFAULT_MODEL = "claude-sonnet-4-20250514"
+
 # Confidence thresholds
 MIN_DRAFTER_CONFIDENCE = 0.85
 MIN_VERIFIER_CONFIDENCE = 0.90
